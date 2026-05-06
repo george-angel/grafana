@@ -40,7 +40,7 @@ func TestLogGroupsRoute(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/log-groups", nil)
 		ds := newTestDatasource()
-		handler := http.HandlerFunc(ds.resourceRequestMiddlewareWithHeaders(ds.LogGroupsHandler))
+		handler := http.HandlerFunc(ds.resourceRequestWithHeadersMiddleware(ds.LogGroupsHandler))
 		handler.ServeHTTP(rr, req)
 
 		assert.Equal(t, http.StatusOK, rr.Code)
@@ -69,7 +69,7 @@ func TestLogGroupsRoute(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/log-groups", nil)
 		ds := newTestDatasource()
-		handler := http.HandlerFunc(ds.resourceRequestMiddlewareWithHeaders(ds.LogGroupsHandler))
+		handler := http.HandlerFunc(ds.resourceRequestWithHeadersMiddleware(ds.LogGroupsHandler))
 		handler.ServeHTTP(rr, req)
 
 		assert.Equal(t, http.StatusOK, rr.Code)
@@ -98,7 +98,7 @@ func TestLogGroupsRoute(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/log-groups?logGroupNamePrefix=some-prefix&logGroupPattern=some-pattern", nil)
 		ds := newTestDatasource()
-		handler := http.HandlerFunc(ds.resourceRequestMiddlewareWithHeaders(ds.LogGroupsHandler))
+		handler := http.HandlerFunc(ds.resourceRequestWithHeadersMiddleware(ds.LogGroupsHandler))
 		handler.ServeHTTP(rr, req)
 
 		assert.Equal(t, http.StatusBadRequest, rr.Code)
@@ -112,7 +112,7 @@ func TestLogGroupsRoute(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/log-groups", nil)
 		ds := newTestDatasource()
-		handler := http.HandlerFunc(ds.resourceRequestMiddlewareWithHeaders(ds.LogGroupsHandler))
+		handler := http.HandlerFunc(ds.resourceRequestWithHeadersMiddleware(ds.LogGroupsHandler))
 		handler.ServeHTTP(rr, req)
 
 		mockLogsService.AssertCalled(t, "GetLogGroups", resources.LogGroupsRequest{
@@ -130,7 +130,7 @@ func TestLogGroupsRoute(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/log-groups", nil)
 		ds := newTestDatasource()
-		handler := http.HandlerFunc(ds.resourceRequestMiddlewareWithHeaders(ds.LogGroupsHandler))
+		handler := http.HandlerFunc(ds.resourceRequestWithHeadersMiddleware(ds.LogGroupsHandler))
 		handler.ServeHTTP(rr, req)
 
 		mockLogsService.AssertCalled(t, "GetLogGroups", resources.LogGroupsRequest{
@@ -146,7 +146,7 @@ func TestLogGroupsRoute(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/log-groups?limit=2", nil)
 		ds := newTestDatasource()
-		handler := http.HandlerFunc(ds.resourceRequestMiddlewareWithHeaders(ds.LogGroupsHandler))
+		handler := http.HandlerFunc(ds.resourceRequestWithHeadersMiddleware(ds.LogGroupsHandler))
 		handler.ServeHTTP(rr, req)
 
 		mockLogsService.AssertCalled(t, "GetLogGroups", resources.LogGroupsRequest{
@@ -161,7 +161,7 @@ func TestLogGroupsRoute(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/log-groups?logGroupNamePrefix=some-prefix", nil)
 		ds := newTestDatasource()
-		handler := http.HandlerFunc(ds.resourceRequestMiddlewareWithHeaders(ds.LogGroupsHandler))
+		handler := http.HandlerFunc(ds.resourceRequestWithHeadersMiddleware(ds.LogGroupsHandler))
 		handler.ServeHTTP(rr, req)
 
 		mockLogsService.AssertCalled(t, "GetLogGroups", resources.LogGroupsRequest{
@@ -177,7 +177,7 @@ func TestLogGroupsRoute(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/log-groups?logGroupPattern=some-pattern", nil)
 		ds := newTestDatasource()
-		handler := http.HandlerFunc(ds.resourceRequestMiddlewareWithHeaders(ds.LogGroupsHandler))
+		handler := http.HandlerFunc(ds.resourceRequestWithHeadersMiddleware(ds.LogGroupsHandler))
 		handler.ServeHTTP(rr, req)
 
 		mockLogsService.AssertCalled(t, "GetLogGroups", resources.LogGroupsRequest{
@@ -193,7 +193,7 @@ func TestLogGroupsRoute(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/log-groups?accountId=some-account-id", nil)
 		ds := newTestDatasource()
-		handler := http.HandlerFunc(ds.resourceRequestMiddlewareWithHeaders(ds.LogGroupsHandler))
+		handler := http.HandlerFunc(ds.resourceRequestWithHeadersMiddleware(ds.LogGroupsHandler))
 		handler.ServeHTTP(rr, req)
 
 		mockLogsService.AssertCalled(t, "GetLogGroups", resources.LogGroupsRequest{
@@ -210,7 +210,7 @@ func TestLogGroupsRoute(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/log-groups", nil)
 		ds := newTestDatasource()
-		handler := http.HandlerFunc(ds.resourceRequestMiddlewareWithHeaders(ds.LogGroupsHandler))
+		handler := http.HandlerFunc(ds.resourceRequestWithHeadersMiddleware(ds.LogGroupsHandler))
 		handler.ServeHTTP(rr, req)
 
 		assert.Equal(t, http.StatusInternalServerError, rr.Code)
@@ -230,7 +230,7 @@ func TestLogGroupsRoute(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/log-groups?region=us-east-1", nil)
 		ds := newTestDatasource()
-		handler := http.HandlerFunc(ds.resourceRequestMiddlewareWithHeaders(ds.LogGroupsHandler))
+		handler := http.HandlerFunc(ds.resourceRequestWithHeadersMiddleware(ds.LogGroupsHandler))
 		handler.ServeHTTP(rr, req)
 
 		assert.Equal(t, http.StatusOK, rr.Code)
@@ -247,7 +247,7 @@ func TestLogGroupsRoute(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/log-groups", nil)
 		ds := newTestDatasource()
-		handler := http.HandlerFunc(ds.resourceRequestMiddlewareWithHeaders(ds.LogGroupsHandler))
+		handler := http.HandlerFunc(ds.resourceRequestWithHeadersMiddleware(ds.LogGroupsHandler))
 		handler.ServeHTTP(rr, req)
 
 		assert.Equal(t, http.StatusOK, rr.Code)
