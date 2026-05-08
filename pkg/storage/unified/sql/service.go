@@ -191,7 +191,7 @@ func ProvideUnifiedStorageGrpcService(cfg *setting.Cfg,
 			services.NewBasicService(nil, bf.Run, nil).WithName("vector-backfiller"))
 	}
 
-	// Reuse the resource server's WriteWriteEvents broadcaster instead
+	// Reuse the resource server's WatchWriteEvents broadcaster instead
 	// of opening a parallel WatchWriteEvents subscription. The server is
 	// constructed below in registerServer; the closure captures `s` and
 	// resolves the broadcaster lazily at scanner.Run() time.
