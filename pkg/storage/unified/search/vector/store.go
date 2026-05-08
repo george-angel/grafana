@@ -25,6 +25,19 @@ type VectorBackend interface {
 
 	Upsert(ctx context.Context, vectors []Vector) error
 
+	// UpsertReplaceSubresources replaces, in a single transaction, the
+	// stored subresource set for each (model, namespace, resource, uid)
+	// present in `vectors`: any stored subresource for those tuples that
+	// isn't being upserted is deleted, then the input vectors are
+	// upserted. Used by the write-path scanner so stale-row cleanup and
+	// the new write commit atomically.
+	//
+	// TODO: only re-embed and upsert subresources whose content actually
+	// changed since the last write. Today the scanner re-embeds every
+	// panel on any dashboard write, which is wasteful when only one
+	// panel changed.
+	UpsertReplaceSubresources(ctx context.Context, vectors []Vector) error
+
 	// Delete removes every resource and subresource under `uid`. model must be non-empty.
 	Delete(ctx context.Context, namespace, model, resource, uid string) error
 

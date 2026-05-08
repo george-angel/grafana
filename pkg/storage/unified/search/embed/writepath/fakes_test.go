@@ -187,6 +187,44 @@ func (f *fakeVector) Search(context.Context, string, string, string, []float32, 
 func (f *fakeVector) Upsert(_ context.Context, vs []vector.Vector) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.upsertLocked(vs)
+}
+
+func (f *fakeVector) UpsertReplaceSubresources(_ context.Context, vs []vector.Vector) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Atomic stale-removal + upsert: stage the delete-stale step, then
+	// the upsert. Failure on either rolls back via the lock-protected
+	// snapshot.
+	type uidKey struct{ ns, model, res, uid string }
+	groups := map[uidKey]map[string]struct{}{}
+	for _, v := range vs {
+		k := uidKey{v.Namespace, v.Model, v.Resource, v.UID}
+		if groups[k] == nil {
+			groups[k] = map[string]struct{}{}
+		}
+		groups[k][v.Subresource] = struct{}{}
+	}
+	for k, keep := range groups {
+		key := subsKey(k.ns, k.model, k.res, k.uid)
+		stored := f.storedSubs[key]
+		var stale []string
+		for sub := range stored {
+			if _, ok := keep[sub]; !ok {
+				stale = append(stale, sub)
+			}
+		}
+		if len(stale) > 0 {
+			f.delsubs = append(f.delsubs, deleteSubsCall{k.ns, k.model, k.res, k.uid, stale})
+			for _, s := range stale {
+				delete(stored, s)
+			}
+		}
+	}
+	return f.upsertLocked(vs)
+}
+
+func (f *fakeVector) upsertLocked(vs []vector.Vector) error {
 	if f.upsertErrFn != nil {
 		if err := f.upsertErrFn(vs); err != nil {
 			return err

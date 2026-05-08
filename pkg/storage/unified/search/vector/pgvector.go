@@ -98,26 +98,108 @@ func (b *pgvectorBackend) Upsert(ctx context.Context, vectors []Vector) error {
 	}
 
 	return b.db.WithTx(ctx, nil, func(ctx context.Context, tx db.Tx) error {
-		for i := range vectors {
-			if err := validateResource(vectors[i].Resource); err != nil {
-				return fmt.Errorf("vector[%d]: %w", i, err)
+		return b.upsertAll(ctx, tx, vectors)
+	})
+}
+
+func (b *pgvectorBackend) UpsertReplaceSubresources(ctx context.Context, vectors []Vector) error {
+	if len(vectors) == 0 {
+		return nil
+	}
+	for i := range vectors {
+		if err := vectors[i].Validate(); err != nil {
+			return fmt.Errorf("vector[%d]: %w", i, err)
+		}
+	}
+
+	type uidKey struct{ resource, namespace, model, uid string }
+	groups := map[uidKey][]string{}
+	for _, v := range vectors {
+		k := uidKey{v.Resource, v.Namespace, v.Model, v.UID}
+		groups[k] = append(groups[k], v.Subresource)
+	}
+
+	return b.db.WithTx(ctx, nil, func(ctx context.Context, tx db.Tx) error {
+		for k, kept := range groups {
+			if err := validateResource(k.resource); err != nil {
+				return err
 			}
-			emb, err := fitEmbedding(vectors[i].Embedding, EmbeddingDim)
+			stored, err := b.subresourceKeysTx(ctx, tx, k.namespace, k.model, k.resource, k.uid)
 			if err != nil {
-				return fmt.Errorf("vector[%d]: %w", i, err)
+				return fmt.Errorf("read subresources %s/%s: %w", k.namespace, k.uid, err)
 			}
-			req := &sqlVectorCollectionUpsertRequest{
-				SQLTemplate: sqltemplate.New(b.dialect),
-				Resource:    vectors[i].Resource,
-				Vector:      &vectors[i],
-				Embedding:   pgvector.NewHalfVector(emb),
+			keep := make(map[string]struct{}, len(kept))
+			for _, s := range kept {
+				keep[s] = struct{}{}
 			}
-			if _, err := dbutil.Exec(ctx, tx, sqlVectorCollectionUpsert, req); err != nil {
-				return fmt.Errorf("upsert vector %s/%s: %w", vectors[i].UID, vectors[i].Subresource, err)
+			var stale []string
+			for _, s := range stored {
+				if _, ok := keep[s]; !ok {
+					stale = append(stale, s)
+				}
+			}
+			if len(stale) > 0 {
+				req := &sqlVectorCollectionDeleteSubresourcesRequest{
+					SQLTemplate:  sqltemplate.New(b.dialect),
+					Resource:     k.resource,
+					Namespace:    k.namespace,
+					Model:        k.model,
+					UID:          k.uid,
+					Subresources: stale,
+				}
+				if _, err := dbutil.Exec(ctx, tx, sqlVectorCollectionDeleteSubresource, req); err != nil {
+					return fmt.Errorf("delete stale subresources %s/%s: %w", k.namespace, k.uid, err)
+				}
 			}
 		}
-		return nil
+		return b.upsertAll(ctx, tx, vectors)
 	})
+}
+
+// upsertAll does the per-vector INSERT/UPSERT loop. Caller owns the
+// transaction; called from both Upsert and UpsertReplaceSubresources.
+func (b *pgvectorBackend) upsertAll(ctx context.Context, tx db.Tx, vectors []Vector) error {
+	for i := range vectors {
+		if err := validateResource(vectors[i].Resource); err != nil {
+			return fmt.Errorf("vector[%d]: %w", i, err)
+		}
+		emb, err := fitEmbedding(vectors[i].Embedding, EmbeddingDim)
+		if err != nil {
+			return fmt.Errorf("vector[%d]: %w", i, err)
+		}
+		req := &sqlVectorCollectionUpsertRequest{
+			SQLTemplate: sqltemplate.New(b.dialect),
+			Resource:    vectors[i].Resource,
+			Vector:      &vectors[i],
+			Embedding:   pgvector.NewHalfVector(emb),
+		}
+		if _, err := dbutil.Exec(ctx, tx, sqlVectorCollectionUpsert, req); err != nil {
+			return fmt.Errorf("upsert vector %s/%s: %w", vectors[i].UID, vectors[i].Subresource, err)
+		}
+	}
+	return nil
+}
+
+// subresourceKeysTx reads the stored subresource keys for one UID
+// inside the caller's transaction.
+func (b *pgvectorBackend) subresourceKeysTx(ctx context.Context, tx db.Tx, namespace, model, resource, uid string) ([]string, error) {
+	req := &sqlVectorCollectionGetContentRequest{
+		SQLTemplate: sqltemplate.New(b.dialect),
+		Resource:    resource,
+		Namespace:   namespace,
+		Model:       model,
+		UID:         uid,
+		Response:    &sqlVectorCollectionGetContentResponse{},
+	}
+	rows, err := dbutil.Query(ctx, tx, sqlVectorCollectionGetContent, req)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.Subresource)
+	}
+	return out, nil
 }
 
 func (b *pgvectorBackend) Delete(ctx context.Context, namespace, model, resource, uid string) error {
