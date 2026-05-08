@@ -15,23 +15,16 @@ import (
 
 // fakeStorage stubs the bits of resource.StorageBackend the scanner uses.
 // ListModifiedSince returns the configured changes (filtered by sinceRv)
-// and a latestRv equal to the highest RV in the slice.
+// and a latestRv equal to the highest RV in the slice. Empty namespace
+// on the request runs cross-namespace, mirroring the real backends.
 type fakeStorage struct {
-	mu        sync.Mutex
-	changes   []*resource.ModifiedResource
-	listErr   error
-	statsErr  error
-	watchErr  error
-	watchCh   chan *resource.WrittenEvent
-	itemErr   error // returned from the iterator partway through
-	itemErrI  int   // index after which to inject itemErr
-
-	// Optional NamespaceLister capability. When namespaceListerNamespaces
-	// is non-nil, fakeStorage exposes ListNamespacesModifiedSince and
-	// returns these values; otherwise the scanner falls back to
-	// GetResourceStats. nsListerErr makes the capability error.
-	namespaceListerNamespaces []string
-	nsListerErr               error
+	mu       sync.Mutex
+	changes  []*resource.ModifiedResource
+	listErr  error
+	watchErr error
+	watchCh  chan *resource.WrittenEvent
+	itemErr  error // returned from the iterator partway through
+	itemErrI int   // index after which to inject itemErr
 }
 
 // emit synchronously delivers a watch event on the channel set up by
@@ -73,48 +66,12 @@ func (f *fakeStorage) WatchWriteEvents(ctx context.Context) (<-chan *resource.Wr
 	return f.watchCh, nil
 }
 
-// ListNamespacesModifiedSince advertises the optional NamespaceLister
-// capability. By default it derives the set from `changes` (mirroring
-// what a real backend would return). Tests can:
-//   - leave defaults: capability returns derived namespaces;
-//   - set namespaceListerNamespaces: override the returned set;
-//   - set nsListerErr: force capability failure so the scanner falls
-//     back to GetResourceStats.
-func (f *fakeStorage) ListNamespacesModifiedSince(_ context.Context, group, res string, sinceRv int64) ([]string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.nsListerErr != nil {
-		return nil, f.nsListerErr
-	}
-	if f.namespaceListerNamespaces != nil {
-		return append([]string(nil), f.namespaceListerNamespaces...), nil
-	}
-	seen := map[string]struct{}{}
-	for _, c := range f.changes {
-		if c.Key.Group != group || c.Key.Resource != res {
-			continue
-		}
-		if c.ResourceVersion <= sinceRv {
-			continue
-		}
-		seen[c.Key.Namespace] = struct{}{}
-	}
-	out := make([]string, 0, len(seen))
-	for ns := range seen {
-		out = append(out, ns)
-	}
-	return out, nil
-}
 // GetResourceStats returns one ResourceStats per distinct
-// (namespace, group, resource) seen in `changes`. The scanner uses this
-// to enumerate active namespaces, so the fake derives the set from the
-// configured changes rather than maintaining a separate registry.
+// (namespace, group, resource) seen in `changes`. Used elsewhere in
+// the codebase; the scanner doesn't call it directly post-refactor.
 func (f *fakeStorage) GetResourceStats(_ context.Context, nsr resource.NamespacedResource, _ int) ([]resource.ResourceStats, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.statsErr != nil {
-		return nil, f.statsErr
-	}
 	seen := map[string]resource.ResourceStats{}
 	for _, c := range f.changes {
 		if c.Key.Group != nsr.Group || c.Key.Resource != nsr.Resource {
@@ -158,21 +115,15 @@ func (f *fakeStorage) ListModifiedSince(_ context.Context, key resource.Namespac
 	}
 	// Snapshot the slice + per-iteration error config so the iterator
 	// closes over a stable view. The scanner runs the iter outside the
-	// lock, and the test may mutate state afterwards. Single-namespace
-	// contract: callers must pass a non-empty namespace.
-	if key.Namespace == "" {
-		err := errors.New("fakeStorage.ListModifiedSince: namespace is required")
-		return 0, func(yield func(*resource.ModifiedResource, error) bool) {
-			yield(nil, err)
-		}
-	}
+	// lock, and the test may mutate state afterwards. Empty namespace
+	// runs cross-namespace, mirroring the real backends.
 	matches := make([]*resource.ModifiedResource, 0, len(f.changes))
 	var latestRv int64
 	for _, c := range f.changes {
 		if c.Key.Group != key.Group || c.Key.Resource != key.Resource {
 			continue
 		}
-		if c.Key.Namespace != key.Namespace {
+		if key.Namespace != "" && c.Key.Namespace != key.Namespace {
 			continue
 		}
 		if c.ResourceVersion <= sinceRv {
@@ -216,9 +167,6 @@ type fakeVector struct {
 	lockUnavailable bool
 	lockAttempts    int
 	lockReleases    int
-
-	// Backfill state — drives ListIncompleteBackfillJobs.
-	jobs []vector.BackfillJob
 }
 
 type deleteCall struct{ Namespace, Model, Resource, UID string }
@@ -307,11 +255,7 @@ func (f *fakeVector) SetLatestRV(_ context.Context, rv int64) error {
 	return nil
 }
 func (f *fakeVector) ListIncompleteBackfillJobs(context.Context) ([]vector.BackfillJob, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]vector.BackfillJob, len(f.jobs))
-	copy(out, f.jobs)
-	return out, nil
+	return nil, nil
 }
 func (f *fakeVector) UpdateBackfillJobCheckpoint(context.Context, int64, string, string) error {
 	return nil

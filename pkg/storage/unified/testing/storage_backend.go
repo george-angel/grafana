@@ -37,8 +37,7 @@ const (
 	TestGetResourceStats          = "get resource stats"
 	TestListHistory               = "list history"
 	TestListHistoryErrorReporting = "list history error reporting"
-	TestListModifiedSince          = "list events since rv"
-	TestListNamespacesModifiedSince = "list namespaces modified since rv"
+	TestListModifiedSince         = "list events since rv"
 	TestListTrash                 = "list trash"
 	TestCreateNewResource         = "create new resource"
 	TestGetResourceLastImportTime = "get resource last import time"
@@ -91,7 +90,6 @@ func RunStorageBackendTest(t *testing.T, newBackend NewBackendFunc, opts *TestOp
 		{TestListTrash, runTestIntegrationBackendTrash},
 		{TestCreateNewResource, runTestIntegrationBackendCreateNewResource},
 		{TestListModifiedSince, runTestIntegrationBackendListModifiedSince},
-		{TestListNamespacesModifiedSince, runTestIntegrationBackendListNamespacesModifiedSince},
 		{TestGetResourceLastImportTime, runTestIntegrationGetResourceLastImportTime},
 		{TestOptimisticLocking, runTestIntegrationBackendOptimisticLocking},
 		{TestClusterScopedResources, runTestIntegrationBackendClusterScopedResources},
@@ -688,85 +686,39 @@ func runTestIntegrationBackendListModifiedSince(t *testing.T, backend resource.S
 			require.Equal(t, expectedRv, actualRv, "wrong RV for %s", name)
 		}
 	})
-}
 
-// namespaceListerCapability mirrors writepath.NamespaceLister so we can
-// type-assert on the optional capability without importing writepath
-// (which would cause a cycle).
-type namespaceListerCapability interface {
-	ListNamespacesModifiedSince(ctx context.Context, group, resource string, sinceRv int64) ([]string, error)
-}
-
-func runTestIntegrationBackendListNamespacesModifiedSince(t *testing.T, backend resource.StorageBackend, nsPrefix string) {
-	nl, ok := backend.(namespaceListerCapability)
-	if !ok {
-		t.Skip("backend does not implement ListNamespacesModifiedSince")
-	}
-	ctx := testutil.NewTestContext(t, time.Now().Add(30*time.Second))
-
-	nsA := nsPrefix + "-nl-a"
-	nsB := nsPrefix + "-nl-b"
-	nsC := nsPrefix + "-nl-c"
-
-	// Write activity in three namespaces. The middle one will be our cutoff.
-	rvA, err := WriteEvent(ctx, backend, "item-a", resourcepb.WatchEvent_ADDED, WithNamespace(nsA))
-	require.NoError(t, err)
-	rvB, err := WriteEvent(ctx, backend, "item-b", resourcepb.WatchEvent_ADDED, WithNamespace(nsB))
-	require.NoError(t, err)
-	rvC, err := WriteEvent(ctx, backend, "item-c", resourcepb.WatchEvent_ADDED, WithNamespace(nsC))
-	require.NoError(t, err)
-	require.Less(t, rvA, rvB)
-	require.Less(t, rvB, rvC)
-
-	t.Run("returns all three namespaces when sinceRv predates them", func(t *testing.T) {
-		got, err := nl.ListNamespacesModifiedSince(ctx, "group", "resource", rvA-1)
+	t.Run("cross-namespace scan with empty namespace", func(t *testing.T) {
+		// Two namespaces, each with a resource named "shared". The
+		// cross-namespace scan must yield both rather than collapsing
+		// them through name-based dedup.
+		nsA := nsPrefix + "-cross-a"
+		nsB := nsPrefix + "-cross-b"
+		startRv, err := WriteEvent(ctx, backend, "shared", resourcepb.WatchEvent_ADDED, WithNamespace(nsA))
 		require.NoError(t, err)
-		assert.Subset(t, got, []string{nsA, nsB, nsC})
-	})
-
-	t.Run("filters by sinceRv", func(t *testing.T) {
-		got, err := nl.ListNamespacesModifiedSince(ctx, "group", "resource", rvB)
+		rvA, err := WriteEvent(ctx, backend, "shared", resourcepb.WatchEvent_MODIFIED, WithNamespaceAndRV(nsA, startRv))
 		require.NoError(t, err)
-		assert.NotContains(t, got, nsA)
-		assert.NotContains(t, got, nsB)
-		assert.Contains(t, got, nsC)
-	})
-
-	t.Run("returns empty when nothing changed past sinceRv", func(t *testing.T) {
-		got, err := nl.ListNamespacesModifiedSince(ctx, "group", "resource", rvC+1<<30)
+		rvB, err := WriteEvent(ctx, backend, "shared", resourcepb.WatchEvent_ADDED, WithNamespace(nsB))
 		require.NoError(t, err)
-		for _, ns := range got {
-			assert.NotEqual(t, nsA, ns)
-			assert.NotEqual(t, nsB, ns)
-			assert.NotEqual(t, nsC, ns)
+
+		key := resource.NamespacedResource{
+			Group:    "group",
+			Resource: "resource",
 		}
-	})
+		_, seq := backend.ListModifiedSince(ctx, key, startRv-1, nil)
 
-	t.Run("dedupes when a namespace has multiple events", func(t *testing.T) {
-		// Write a second event in nsA so the namespace would naively
-		// surface twice if dedup were broken.
-		_, err := WriteEvent(ctx, backend, "item-a", resourcepb.WatchEvent_MODIFIED, WithNamespaceAndRV(nsA, rvA))
-		require.NoError(t, err)
-
-		got, err := nl.ListNamespacesModifiedSince(ctx, "group", "resource", rvA-1)
-		require.NoError(t, err)
-		count := 0
-		for _, ns := range got {
-			if ns == nsA {
-				count++
+		seen := map[string]int64{}
+		for res, err := range seq {
+			require.NoError(t, err)
+			if res.Key.Name != "shared" {
+				continue
 			}
+			if res.Key.Namespace != nsA && res.Key.Namespace != nsB {
+				continue
+			}
+			seen[res.Key.Namespace] = res.ResourceVersion
 		}
-		assert.Equal(t, 1, count, "namespace should appear once even with multiple events")
-	})
-
-	t.Run("filters by group/resource", func(t *testing.T) {
-		got, err := nl.ListNamespacesModifiedSince(ctx, "other-group", "resource", rvA-1)
-		require.NoError(t, err)
-		for _, ns := range got {
-			assert.NotEqual(t, nsA, ns)
-			assert.NotEqual(t, nsB, ns)
-			assert.NotEqual(t, nsC, ns)
-		}
+		require.Equal(t, rvA, seen[nsA], "namespace A should yield latest rv for shared")
+		require.Equal(t, rvB, seen[nsB], "namespace B should yield latest rv for shared")
 	})
 }
 

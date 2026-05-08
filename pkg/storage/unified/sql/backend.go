@@ -1118,12 +1118,15 @@ func (b *backend) ListModifiedSince(ctx context.Context, key resource.Namespaced
 				continue
 			}
 
-			// Deduplicate by name (namespace, group, and resource are always the same in the result set)
-			if _, ok := seen[mr.Key.Name]; ok {
+			// Deduplicate by (namespace, name). The query may run
+			// cross-namespace (empty Namespace argument) for the
+			// write-path scanner, so two resources with the same name
+			// in different namespaces must each yield once.
+			dedupKey := mr.Key.Namespace + "/" + mr.Key.Name
+			if _, ok := seen[dedupKey]; ok {
 				continue
 			}
-
-			seen[mr.Key.Name] = struct{}{}
+			seen[dedupKey] = struct{}{}
 			if !yield(mr, nil) {
 				return
 			}
@@ -1131,50 +1134,6 @@ func (b *backend) ListModifiedSince(ctx context.Context, key resource.Namespaced
 	}
 
 	return latestRv, seq
-}
-
-// ListNamespacesModifiedSince returns the distinct namespaces that have
-// at least one resource_history row with the given group/resource and a
-// resource_version greater than sinceRv. Cheap discovery query — the
-// write-path scanner uses it to fan out per-namespace work without
-// enumerating every namespace via GetResourceStats.
-//
-// Not part of the StorageBackend interface; the writepath package
-// type-asserts on a NamespaceLister capability so backends that don't
-// implement it (e.g. the kv backend) keep working unchanged.
-func (b *backend) ListNamespacesModifiedSince(ctx context.Context, group, resource string, sinceRv int64) ([]string, error) {
-	ctx, span := tracer.Start(ctx, "sql.backend.ListNamespacesModifiedSince", trace.WithAttributes(
-		attribute.String("group", group),
-		attribute.String("resource", resource),
-		attribute.Int64("sinceRv", sinceRv),
-	))
-	defer span.End()
-
-	sinceRv = toMicrosecondRV(sinceRv)
-	req := sqlResourceDistinctNamespacesRequest{
-		SQLTemplate: sqltemplate.New(b.dialect),
-		Group:       group,
-		Resource:    resource,
-		SinceRv:     sinceRv,
-	}
-	rows, err := dbutil.QueryRows(ctx, b.db, sqlResourceHistoryDistinctNamespaces, req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if cerr := rows.Close(); cerr != nil {
-			b.log.Warn("ListNamespacesModifiedSince close rows", "error", cerr)
-		}
-	}()
-	var out []string
-	for rows.Next() {
-		var ns string
-		if err := rows.Scan(&ns); err != nil {
-			return nil, err
-		}
-		out = append(out, ns)
-	}
-	return out, nil
 }
 
 // listAtRevision fetches the resources from the resource_history table at a specific revision.

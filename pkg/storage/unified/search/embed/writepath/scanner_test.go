@@ -34,7 +34,7 @@ func minimalDashboard(uid, title string) []byte {
 }
 
 // multiPanelDashboard returns a dashboard with N panels — used to verify
-// pooling collapses a fan of items into a single embed call.
+// per-dashboard embedding does one EmbedText call regardless of panel count.
 func multiPanelDashboard(uid, title string, n int) []byte {
 	panels := make([]any, n)
 	for i := 0; i < n; i++ {
@@ -44,22 +44,12 @@ func multiPanelDashboard(uid, title string, n int) []byte {
 	return body
 }
 
-// newScanner builds a Scanner and runs bootstrap synchronously, so
-// runOnce() picks up everything the test pre-loaded into st.changes.
-// Tests that want to observe pre-bootstrap state should use newScannerNoBootstrap.
+// newScanner builds a Scanner without running bootstrap. Tests that
+// want bootstrap should set vec.latestRV first (so bootstrap doesn't
+// short-circuit on RV=0) and call s.bootstrap(ctx) explicitly.
 func newScanner(t *testing.T, st *fakeStorage, vec *fakeVector) (*Scanner, *fakeText) {
 	t.Helper()
-	s, text := newScannerNoBootstrap(t, st, vec)
-	s.bootstrap(context.Background())
-	return s, text
-}
-
-func newScannerNoBootstrap(t *testing.T, st *fakeStorage, vec *fakeVector) (*Scanner, *fakeText) {
-	t.Helper()
 	text := &fakeText{dim: 4}
-	// Default Subscribe stub: hands the test's fakeStorage watch channel
-	// back. Tests that don't drive the watch path leave the channel
-	// unused; tests that do call st.emit() directly.
 	subscribe := func(ctx context.Context, _ string) (<-chan *resource.WrittenEvent, func(), error) {
 		ch, err := st.WatchWriteEvents(ctx)
 		if err != nil {
@@ -138,85 +128,69 @@ func TestScanner_NewValidatesInputs(t *testing.T) {
 	}
 }
 
-func TestScanner_NoChanges_AdvancesToLatestRV(t *testing.T) {
+func TestScanner_EmptyQueue_NoOp(t *testing.T) {
 	st := &fakeStorage{}
 	vec := newFakeVector()
 	s, text := newScanner(t, st, vec)
 
 	s.runOnce(context.Background())
 
-	// Empty change set: no embed call, no upsert, checkpoint stays at 0.
-	assert.Equal(t, int64(0), vec.latestRV)
 	assert.Empty(t, vec.upserts)
 	assert.Empty(t, vec.deletes)
-	assert.Equal(t, 0, text.calls, "no embed call on an empty cycle")
+	assert.Equal(t, 0, text.calls)
+	assert.Equal(t, int64(0), vec.latestRV)
 }
 
-func TestScanner_HappyPath_PoolsEmbedAndUpsertAcrossNamespaces(t *testing.T) {
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
-		dashChange(resourcepb.WatchEvent_MODIFIED, "ns-b", "dash-2", 200, minimalDashboard("dash-2", "Dash 2")),
-	}
+func TestScanner_HappyPath_PerDashboardEmbed(t *testing.T) {
+	// Two dashboards from different namespaces should produce two
+	// EmbedText calls (one per dashboard) and two Upsert calls.
 	vec := newFakeVector()
-	s, text := newScanner(t, st, vec)
+	s, text := newScanner(t, &fakeStorage{}, vec)
+
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")))
+	s.enqueue(dashEvent(resourcepb.WatchEvent_MODIFIED, "ns-b", "dash-2", 200, minimalDashboard("dash-2", "Dash 2")))
 
 	s.runOnce(context.Background())
 
-	// One pooled EmbedText call covers items from both namespaces.
-	assert.Equal(t, 1, text.calls, "pooled embed call across all namespaces")
-	require.Len(t, vec.upserts, 1, "single Upsert wraps every pooled vector")
-	assert.Len(t, vec.upserts[0], 2, "two dashboards = two vectors in the pooled upsert")
+	assert.Equal(t, 2, text.calls, "one EmbedText call per dashboard")
+	require.Len(t, vec.upserts, 2, "one Upsert per dashboard")
 	assert.Equal(t, int64(200), vec.latestRV)
 	assert.Equal(t, 1, vec.lockAttempts)
 	assert.Equal(t, 1, vec.lockReleases)
 }
 
-func TestScanner_HappyPath_PoolsManyPanelsIntoOneEmbedCall(t *testing.T) {
-	// One dashboard with many panels + one dashboard with one panel.
-	// Pooling must produce a single EmbedText call regardless of how the
-	// panels are distributed across dashboards.
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "big", 100, multiPanelDashboard("big", "Big Dash", 12)),
-		dashChange(resourcepb.WatchEvent_ADDED, "ns-b", "small", 200, minimalDashboard("small", "Small Dash")),
-	}
+func TestScanner_MultiPanelDashboard_SingleEmbedCall(t *testing.T) {
+	// All panels of one dashboard go through BatchEmbedder.Embed in
+	// a single call (provider-side chunking handles panel count).
 	vec := newFakeVector()
-	s, text := newScanner(t, st, vec)
+	s, text := newScanner(t, &fakeStorage{}, vec)
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "big", 100, multiPanelDashboard("big", "Big Dash", 12)))
 
 	s.runOnce(context.Background())
 
 	assert.Equal(t, 1, text.calls)
 	require.Len(t, vec.upserts, 1)
-	assert.Len(t, vec.upserts[0], 13, "12 panels + 1 panel = 13 pooled vectors")
+	assert.Len(t, vec.upserts[0], 12, "12 panels = 12 vectors in the upsert")
 }
 
-func TestScanner_DeleteEvent_CallsVectorDeleteInline(t *testing.T) {
-	// Deletes don't need embeddings, so they execute inline in the
-	// per-namespace loop — not in the pooled phase.
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_DELETED, "ns", "dash-x", 50, nil),
-	}
+func TestScanner_DeleteEvent_CallsVectorDelete(t *testing.T) {
 	vec := newFakeVector()
-	s, text := newScanner(t, st, vec)
+	s, text := newScanner(t, &fakeStorage{}, vec)
+	s.enqueue(dashEvent(resourcepb.WatchEvent_DELETED, "ns", "dash-x", 50, nil))
 
 	s.runOnce(context.Background())
 
 	require.Len(t, vec.deletes, 1)
 	assert.Equal(t, deleteCall{Namespace: "ns", Model: testModel, Resource: dashRes, UID: "dash-x"}, vec.deletes[0])
 	assert.Equal(t, int64(50), vec.latestRV)
-	assert.Equal(t, 0, text.calls, "delete-only cycle does not call the embedder")
+	assert.Equal(t, 0, text.calls, "delete does not call the embedder")
 }
 
 func TestScanner_LockUnavailable_NoWork(t *testing.T) {
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
-	}
 	vec := newFakeVector()
 	vec.lockUnavailable = true
-	s, text := newScanner(t, st, vec)
+	s, text := newScanner(t, &fakeStorage{}, vec)
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")))
 
 	s.runOnce(context.Background())
 
@@ -227,138 +201,10 @@ func TestScanner_LockUnavailable_NoWork(t *testing.T) {
 	assert.Equal(t, 0, text.calls)
 }
 
-func TestScanner_PooledUpsertFailure_BlocksAdvanceAtLowestRV(t *testing.T) {
-	// Pooling makes the failure mode all-or-nothing: a single Upsert
-	// covers every dashboard's vectors, so any failure inside the
-	// upsert pins the global advance to (lowestRvInBatch - 1).
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns", "first", 100, minimalDashboard("first", "First")),
-		dashChange(resourcepb.WatchEvent_ADDED, "ns", "second", 200, minimalDashboard("second", "Second")),
-		dashChange(resourcepb.WatchEvent_ADDED, "ns", "third", 300, minimalDashboard("third", "Third")),
-	}
-	vec := newFakeVector()
-	vec.upsertErr = errBoom
-	s, _ := newScanner(t, st, vec)
-	s.runOnce(context.Background())
-
-	assert.Empty(t, vec.upserts, "Upsert failed; nothing was recorded")
-	assert.Equal(t, int64(99), vec.latestRV, "checkpoint pinned to lowest pending RV - 1")
-}
-
-func TestScanner_PooledEmbedFailure_BlocksAdvanceAtLowestRV(t *testing.T) {
-	// Same property as the upsert-failure test, but driven by an embedder error.
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns", "alpha", 100, minimalDashboard("alpha", "Alpha")),
-		dashChange(resourcepb.WatchEvent_ADDED, "ns", "beta", 200, minimalDashboard("beta", "Beta")),
-	}
-	vec := newFakeVector()
-	s, text := newScanner(t, st, vec)
-	text.failNext = errBoom
-
-	s.runOnce(context.Background())
-
-	assert.Empty(t, vec.upserts)
-	assert.Equal(t, int64(99), vec.latestRV)
-}
-
-func TestScanner_IteratorError_DoesNotAdvance(t *testing.T) {
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
-	}
-	st.itemErr = errBoom
-	st.itemErrI = 0
-	vec := newFakeVector()
-	s, _ := newScanner(t, st, vec)
-
-	s.runOnce(context.Background())
-
-	assert.Equal(t, int64(0), vec.latestRV, "iterator-level error must not advance the checkpoint")
-}
-
-func TestScanner_StaleSubresources_AreDeletedBeforeUpsert(t *testing.T) {
-	// Pre-seed two stored panels under one dashboard, then drive an
-	// update whose extract only contains panel/1. Cleanup runs inline
-	// during collection (per-dashboard), so it lands before the pooled
-	// upsert.
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_MODIFIED, "ns", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
-	}
-	vec := newFakeVector()
-	k := subsKey("ns", testModel, dashRes, "dash-1")
-	vec.storedSubs[k] = map[string]string{
-		"panel/1": "old content",
-		"panel/2": "stale panel that should be deleted",
-	}
-
-	s, _ := newScanner(t, st, vec)
-	s.runOnce(context.Background())
-
-	require.Len(t, vec.delsubs, 1)
-	assert.ElementsMatch(t, []string{"panel/2"}, vec.delsubs[0].Subresources)
-	require.Len(t, vec.upserts, 1)
-}
-
-func TestScanner_MonotonicCheckpoint(t *testing.T) {
-	// Two cycles. Each cycle issues at most one pooled embed/upsert.
-	// After cycle 1 the checkpoint is at 100; cycle 2 must not
-	// reprocess RV 100 and should advance to 200.
-	vec := newFakeVector()
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
-	}
-	s, text := newScanner(t, st, vec)
-	s.runOnce(context.Background())
-	require.Len(t, vec.upserts, 1)
-	require.Equal(t, int64(100), vec.latestRV)
-	require.Equal(t, 1, text.calls)
-
-	// Simulate a watch event for the new write — the scanner enqueues
-	// the event with its payload, so cycle 2 doesn't need to re-list.
-	st.changes = append(st.changes, dashChange(resourcepb.WatchEvent_MODIFIED, "ns", "dash-2", 200, minimalDashboard("dash-2", "Dash 2")))
-	s.enqueue(dashEvent(resourcepb.WatchEvent_MODIFIED, "ns", "dash-2", 200, minimalDashboard("dash-2", "Dash 2")))
-	s.runOnce(context.Background())
-
-	require.Len(t, vec.upserts, 2, "second cycle adds one more pooled upsert")
-	assert.Len(t, vec.upserts[1], 1, "only the unseen RV 200 event ended up in cycle 2's batch")
-	require.Equal(t, int64(200), vec.latestRV)
-	require.Equal(t, 2, text.calls, "one embed call per non-empty cycle")
-}
-
-func TestScanner_UnknownAction_BlocksAdvance(t *testing.T) {
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		{
-			Action: resourcepb.WatchEvent_BOOKMARK,
-			Key: resourcepb.ResourceKey{
-				Group: dashGroup, Resource: dashRes, Namespace: "ns", Name: "weird",
-			},
-			ResourceVersion: 50,
-		},
-	}
-	vec := newFakeVector()
-	s, text := newScanner(t, st, vec)
-	s.runOnce(context.Background())
-
-	assert.Empty(t, vec.upserts)
-	assert.Empty(t, vec.deletes)
-	assert.Equal(t, 0, text.calls)
-	assert.Equal(t, int64(49), vec.latestRV, "checkpoint stops at (failed - 1)")
-}
-
-func TestScanner_MultiNamespace_FailureBlocksGlobalAdvance(t *testing.T) {
-	// Pooling makes any per-cycle Upsert failure global. Even if only
-	// one namespace has a problem, the checkpoint stops at the lowest
-	// pending RV minus one.
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "boom", 100, minimalDashboard("boom", "Boom")),
-		dashChange(resourcepb.WatchEvent_ADDED, "ns-b", "ok", 200, minimalDashboard("ok", "OK")),
-	}
+func TestScanner_PerEventFailure_BlocksAdvanceAtFailureRV(t *testing.T) {
+	// Three dashboards: two succeed at RVs 100 and 300, one fails at 200.
+	// Cursor advances to 199 so the failure is retried next cycle and
+	// the unrelated successes don't get rolled back.
 	vec := newFakeVector()
 	vec.upsertErrFn = func(vs []vector.Vector) error {
 		for _, v := range vs {
@@ -368,148 +214,159 @@ func TestScanner_MultiNamespace_FailureBlocksGlobalAdvance(t *testing.T) {
 		}
 		return nil
 	}
-	s, _ := newScanner(t, st, vec)
+	s, _ := newScanner(t, &fakeStorage{}, vec)
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "ok-a", 100, minimalDashboard("ok-a", "OK A")))
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "boom", 200, minimalDashboard("boom", "Boom")))
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "ok-b", 300, minimalDashboard("ok-b", "OK B")))
+
 	s.runOnce(context.Background())
 
-	assert.Empty(t, vec.upserts, "pooled upsert containing 'boom' fails wholesale")
-	assert.Equal(t, int64(99), vec.latestRV, "global advance stops at lowest pending RV - 1")
+	// ok-a and ok-b succeeded; boom failed and is re-queued.
+	require.Len(t, vec.upserts, 2)
+	assert.Equal(t, int64(199), vec.latestRV)
+
+	// boom should be back in the queue.
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	_, hasBoom := s.queue[eventQueueKey(dashGroup, dashRes, "ns", "boom")]
+	assert.True(t, hasBoom)
 }
 
-func TestScanner_NoNamespacesActive_NoOp(t *testing.T) {
-	st := &fakeStorage{}
+func TestScanner_StaleSubresources_AreDeletedBeforeUpsert(t *testing.T) {
+	// Pre-seed two stored panels under one dashboard, then drive an
+	// update whose extract only contains panel/1.
 	vec := newFakeVector()
-	s, text := newScanner(t, st, vec)
+	k := subsKey("ns", testModel, dashRes, "dash-1")
+	vec.storedSubs[k] = map[string]string{
+		"panel/1": "old content",
+		"panel/2": "stale panel that should be deleted",
+	}
 
+	s, _ := newScanner(t, &fakeStorage{}, vec)
+	s.enqueue(dashEvent(resourcepb.WatchEvent_MODIFIED, "ns", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")))
+	s.runOnce(context.Background())
+
+	require.Len(t, vec.delsubs, 1)
+	assert.ElementsMatch(t, []string{"panel/2"}, vec.delsubs[0].Subresources)
+	require.Len(t, vec.upserts, 1)
+}
+
+func TestScanner_MonotonicCheckpoint(t *testing.T) {
+	vec := newFakeVector()
+	s, text := newScanner(t, &fakeStorage{}, vec)
+
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")))
+	s.runOnce(context.Background())
+	require.Len(t, vec.upserts, 1)
+	require.Equal(t, int64(100), vec.latestRV)
+	require.Equal(t, 1, text.calls)
+
+	// Same dashboard at a higher RV: dedup keeps the new one.
+	s.enqueue(dashEvent(resourcepb.WatchEvent_MODIFIED, "ns", "dash-1", 200, minimalDashboard("dash-1", "Dash 1 v2")))
+	s.runOnce(context.Background())
+	require.Len(t, vec.upserts, 2)
+	require.Equal(t, int64(200), vec.latestRV)
+	require.Equal(t, 2, text.calls)
+}
+
+func TestScanner_UnknownAction_BlocksAdvance(t *testing.T) {
+	vec := newFakeVector()
+	s, text := newScanner(t, &fakeStorage{}, vec)
+	s.enqueue(&pendingEvent{
+		action:    resourcepb.WatchEvent_BOOKMARK,
+		group:     dashGroup,
+		resource:  dashRes,
+		namespace: "ns",
+		name:      "weird",
+		rv:        50,
+	})
 	s.runOnce(context.Background())
 
 	assert.Empty(t, vec.upserts)
 	assert.Empty(t, vec.deletes)
 	assert.Equal(t, 0, text.calls)
-	assert.Equal(t, int64(0), vec.latestRV)
+	assert.Equal(t, int64(49), vec.latestRV, "checkpoint stops at (failed - 1)")
 }
 
-func TestScanner_Bootstrap_PrefersNamespaceListerCapability(t *testing.T) {
-	// fakeStorage advertises the NamespaceLister capability by default.
-	// Bootstrap should hit it instead of GetResourceStats.
+// ---------- Bootstrap ----------
+
+func TestScanner_Bootstrap_SkipsWhenCursorIsZero(t *testing.T) {
+	st := &fakeStorage{}
+	st.changes = []*resource.ModifiedResource{
+		dashChange(resourcepb.WatchEvent_ADDED, "ns", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
+	}
+	vec := newFakeVector() // latestRV stays 0
+	s, text := newScanner(t, st, vec)
+
+	s.bootstrap(context.Background())
+	s.runOnce(context.Background())
+
+	assert.Empty(t, vec.upserts, "bootstrap is a no-op when cursor is 0")
+	assert.Equal(t, 0, text.calls)
+}
+
+func TestScanner_Bootstrap_PullsCrossNamespaceEvents(t *testing.T) {
+	// Cursor non-zero → bootstrap walks every namespace in one pass via
+	// cross-namespace ListModifiedSince, enqueues each event, processes
+	// them per-dashboard.
 	st := &fakeStorage{}
 	st.changes = []*resource.ModifiedResource{
 		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
 		dashChange(resourcepb.WatchEvent_ADDED, "ns-b", "dash-2", 200, minimalDashboard("dash-2", "Dash 2")),
 	}
-	// A non-nil override forces this exact set, proving the scanner used
-	// the capability rather than deriving from changes via GetResourceStats.
-	st.namespaceListerNamespaces = []string{"ns-a", "ns-b"}
-
 	vec := newFakeVector()
-	s, _ := newScanner(t, st, vec) // bootstraps inline
+	vec.latestRV = 50 // anything below the change RVs
+	s, text := newScanner(t, st, vec)
+
+	s.bootstrap(context.Background())
 	s.runOnce(context.Background())
 
-	require.Len(t, vec.upserts, 1)
-	assert.Len(t, vec.upserts[0], 2)
+	require.Len(t, vec.upserts, 2)
+	assert.Equal(t, 2, text.calls)
 	assert.Equal(t, int64(200), vec.latestRV)
 }
 
-func TestScanner_Bootstrap_NamespaceListerError_NoRecovery(t *testing.T) {
-	// NamespaceLister error means bootstrap can't recover missed
-	// writes. The scanner logs and proceeds; only the watch can
-	// surface new activity from this point on.
+func TestScanner_Bootstrap_FiltersBelowCursor(t *testing.T) {
 	st := &fakeStorage{}
 	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
+		dashChange(resourcepb.WatchEvent_ADDED, "ns", "old", 100, minimalDashboard("old", "Old")),
+		dashChange(resourcepb.WatchEvent_ADDED, "ns", "new", 200, minimalDashboard("new", "New")),
 	}
-	st.nsListerErr = errBoom
-	vec := newFakeVector()
-	s, _ := newScanner(t, st, vec)
-	s.runOnce(context.Background())
-
-	assert.Empty(t, vec.upserts, "no recovery without NamespaceLister")
-	assert.Equal(t, int64(0), vec.latestRV, "checkpoint stays put")
-}
-
-func TestScanner_WatchEvent_DrivesNextCycle(t *testing.T) {
-	// Storage starts empty → bootstrap finds nothing → cycle 1 is a no-op.
-	// A watch event arrives carrying the payload directly; cycle 2 embeds it
-	// without re-listing storage.
-	st := &fakeStorage{}
-	vec := newFakeVector()
-	s, text := newScannerNoBootstrap(t, st, vec)
-	s.bootstrap(context.Background())
-
-	s.runOnce(context.Background())
-	require.Empty(t, vec.upserts)
-	require.Equal(t, 0, text.calls, "no work to do on cycle 1")
-
-	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns-x", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")))
-
-	s.runOnce(context.Background())
-	require.Len(t, vec.upserts, 1, "cycle 2 picks up the watch event")
-	assert.Equal(t, 1, text.calls)
-	assert.Equal(t, int64(100), vec.latestRV)
-}
-
-func TestScanner_EnqueueDedup_KeepsHighestRV(t *testing.T) {
-	// Two events for the same dashboard at different RVs. Only the
-	// highest RV's content should be embedded.
-	st := &fakeStorage{}
-	vec := newFakeVector()
-	s, text := newScannerNoBootstrap(t, st, vec)
-
-	// Older RV first.
-	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash", 100, minimalDashboard("dash", "Old Title")))
-	// Newer RV — wins.
-	s.enqueue(dashEvent(resourcepb.WatchEvent_MODIFIED, "ns", "dash", 200, minimalDashboard("dash", "New Title")))
-	// Older RV arriving after newer (replay scenario) — dropped.
-	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash", 100, minimalDashboard("dash", "Old Again")))
-
-	s.runOnce(context.Background())
-	assert.Equal(t, 1, text.calls, "single embed call")
-	require.Len(t, vec.upserts, 1)
-	require.Len(t, vec.upserts[0], 1, "only the highest-RV event was embedded")
-	assert.Equal(t, int64(200), vec.upserts[0][0].ResourceVersion)
-	assert.Equal(t, int64(200), vec.latestRV)
-}
-
-func TestScanner_EnqueueDedup_DeleteOverridesOlderUpsert(t *testing.T) {
-	// A delete at a higher RV must beat an earlier upsert for the same resource.
-	st := &fakeStorage{}
-	vec := newFakeVector()
-	s, _ := newScannerNoBootstrap(t, st, vec)
-
-	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash", 100, minimalDashboard("dash", "Title")))
-	s.enqueue(dashEvent(resourcepb.WatchEvent_DELETED, "ns", "dash", 200, nil))
-
-	s.runOnce(context.Background())
-	assert.Empty(t, vec.upserts, "older upsert was overridden by the newer delete")
-	require.Len(t, vec.deletes, 1)
-	assert.Equal(t, "dash", vec.deletes[0].UID)
-	assert.Equal(t, int64(200), vec.latestRV)
-}
-
-func TestScanner_CursorFiltersAlreadyProcessedEvents(t *testing.T) {
-	// Pre-set the checkpoint to 150. Any event with RV ≤ 150 must be
-	// dropped at the cursor check.
-	st := &fakeStorage{}
 	vec := newFakeVector()
 	vec.latestRV = 150
-	s, text := newScannerNoBootstrap(t, st, vec)
+	s, _ := newScanner(t, st, vec)
 
-	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "old", 100, minimalDashboard("old", "Old"))) // already processed
-	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "new", 200, minimalDashboard("new", "New")))
-
+	s.bootstrap(context.Background())
 	s.runOnce(context.Background())
-	assert.Equal(t, 1, text.calls)
+
 	require.Len(t, vec.upserts, 1)
-	require.Len(t, vec.upserts[0], 1, "only the post-cursor event embedded")
 	assert.Equal(t, "new", vec.upserts[0][0].UID)
 	assert.Equal(t, int64(200), vec.latestRV)
 }
 
-func TestScanner_WatchConsumer_IgnoresUnrelatedResources(t *testing.T) {
-	// The consumer goroutine should drop events whose resource isn't
-	// configured (e.g. folders, when only the dashboards builder is registered).
+// ---------- Watch path ----------
+
+func TestScanner_WatchEvent_DrivesNextCycle(t *testing.T) {
 	st := &fakeStorage{}
 	vec := newFakeVector()
-	s, _ := newScannerNoBootstrap(t, st, vec)
+	s, text := newScanner(t, st, vec)
+
+	s.runOnce(context.Background())
+	require.Empty(t, vec.upserts)
+	require.Equal(t, 0, text.calls)
+
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns-x", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")))
+	s.runOnce(context.Background())
+
+	require.Len(t, vec.upserts, 1)
+	assert.Equal(t, 1, text.calls)
+	assert.Equal(t, int64(100), vec.latestRV)
+}
+
+func TestScanner_WatchConsumer_IgnoresUnrelatedResources(t *testing.T) {
+	st := &fakeStorage{}
+	vec := newFakeVector()
+	s, _ := newScanner(t, st, vec)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -535,7 +392,6 @@ func TestScanner_WatchConsumer_IgnoresUnrelatedResources(t *testing.T) {
 
 	dashKey := eventQueueKey(dashGroup, dashRes, "ns-y", "d1")
 	folderKey := eventQueueKey("folder.grafana.app", "folders", "ns-x", "f1")
-
 	require.Eventually(t, func() bool {
 		s.queueMu.Lock()
 		defer s.queueMu.Unlock()
@@ -545,175 +401,119 @@ func TestScanner_WatchConsumer_IgnoresUnrelatedResources(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 }
 
-func TestScanner_PooledFailure_ReEnqueuesSourceEvents(t *testing.T) {
-	// On a pooled failure, every source event that contributed must
-	// land back on the queue so the next cycle retries it.
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
-		dashChange(resourcepb.WatchEvent_ADDED, "ns-b", "dash-2", 200, minimalDashboard("dash-2", "Dash 2")),
-	}
+// ---------- Dedup ----------
+
+func TestScanner_EnqueueDedup_KeepsHighestRV(t *testing.T) {
 	vec := newFakeVector()
-	vec.upsertErr = errBoom
-	s, _ := newScanner(t, st, vec)
+	s, text := newScanner(t, &fakeStorage{}, vec)
+
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash", 100, minimalDashboard("dash", "Old Title")))
+	s.enqueue(dashEvent(resourcepb.WatchEvent_MODIFIED, "ns", "dash", 200, minimalDashboard("dash", "New Title")))
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash", 100, minimalDashboard("dash", "Old Again")))
+
 	s.runOnce(context.Background())
 
-	assert.Empty(t, vec.upserts)
-	assert.Equal(t, int64(99), vec.latestRV, "pooled failure pins target to lowest pending RV - 1")
-
-	keyA := eventQueueKey(dashGroup, dashRes, "ns-a", "dash-1")
-	keyB := eventQueueKey(dashGroup, dashRes, "ns-b", "dash-2")
-
-	s.queueMu.Lock()
-	defer s.queueMu.Unlock()
-	_, hasA := s.queue[keyA]
-	_, hasB := s.queue[keyB]
-	assert.True(t, hasA, "dash-1 re-enqueued after pooled failure")
-	assert.True(t, hasB, "dash-2 re-enqueued after pooled failure")
+	assert.Equal(t, 1, text.calls)
+	require.Len(t, vec.upserts, 1)
+	require.Len(t, vec.upserts[0], 1)
+	assert.Equal(t, int64(200), vec.upserts[0][0].ResourceVersion)
+	assert.Equal(t, int64(200), vec.latestRV)
 }
 
-func TestScanner_BackfillInProgress_BootstrapSkipped(t *testing.T) {
-	// An incomplete backfill job for our resource means bootstrap should
-	// not list/enqueue anything. The backfill's CompleteBackfillJob
-	// hand-off will move vector_latest_rv forward when it's done.
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns-a", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
-	}
+func TestScanner_EnqueueDedup_DeleteOverridesOlderUpsert(t *testing.T) {
 	vec := newFakeVector()
-	vec.jobs = []vector.BackfillJob{{
-		ID: 1, Model: testModel, Resource: dashRes, StoppingRV: 1000,
-	}}
-	s, _ := newScanner(t, st, vec) // bootstraps inline
+	s, _ := newScanner(t, &fakeStorage{}, vec)
+
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash", 100, minimalDashboard("dash", "Title")))
+	s.enqueue(dashEvent(resourcepb.WatchEvent_DELETED, "ns", "dash", 200, nil))
+
 	s.runOnce(context.Background())
 
-	assert.Empty(t, vec.upserts, "backfill in progress; nothing should be embedded")
-	assert.Equal(t, int64(0), vec.latestRV)
+	assert.Empty(t, vec.upserts, "older upsert overridden by newer delete")
+	require.Len(t, vec.deletes, 1)
+	assert.Equal(t, "dash", vec.deletes[0].UID)
+	assert.Equal(t, int64(200), vec.latestRV)
 }
 
-func TestScanner_BackfillInProgress_WatchEventsDeferred(t *testing.T) {
-	// Watch events arriving while backfill runs are queued but not
-	// processed. They drain on the next cycle after backfill completes.
-	st := &fakeStorage{}
+func TestScanner_CursorFiltersAlreadyProcessedEvents(t *testing.T) {
 	vec := newFakeVector()
-	vec.jobs = []vector.BackfillJob{{
-		ID: 1, Model: testModel, Resource: dashRes, StoppingRV: 1000,
-	}}
+	vec.latestRV = 150
+	s, text := newScanner(t, &fakeStorage{}, vec)
 
-	s, text := newScannerNoBootstrap(t, st, vec)
-
-	// Live event arrives during backfill.
-	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns-x", "dash-x", 1500, minimalDashboard("dash-x", "Dash X")))
-	s.runOnce(context.Background())
-
-	assert.Empty(t, vec.upserts, "deferred while backfill is in flight")
-	assert.Equal(t, 0, text.calls)
-
-	// Backfill completes (test simulates handoff).
-	vec.jobs = nil
-	vec.latestRV = 1000
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "old", 100, minimalDashboard("old", "Old")))
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "new", 200, minimalDashboard("new", "New")))
 
 	s.runOnce(context.Background())
 
-	require.Len(t, vec.upserts, 1, "deferred event drains once backfill clears")
-	assert.Equal(t, "dash-x", vec.upserts[0][0].UID)
-	assert.Equal(t, int64(1500), vec.latestRV)
+	assert.Equal(t, 1, text.calls)
+	require.Len(t, vec.upserts, 1)
+	assert.Equal(t, "new", vec.upserts[0][0].UID)
+	assert.Equal(t, int64(200), vec.latestRV)
 }
 
-func TestScanner_BackfillForDifferentResource_DoesNotBlock(t *testing.T) {
-	// A backfill job for a model/resource the scanner doesn't handle
-	// (different model in this case) must not gate dashboard work.
-	st := &fakeStorage{}
-	st.changes = []*resource.ModifiedResource{
-		dashChange(resourcepb.WatchEvent_ADDED, "ns", "dash-1", 100, minimalDashboard("dash-1", "Dash 1")),
-	}
-	vec := newFakeVector()
-	vec.jobs = []vector.BackfillJob{{
-		ID: 1, Model: "some-other-model", Resource: dashRes, StoppingRV: 1000,
-	}}
-	s, _ := newScanner(t, st, vec)
-	s.runOnce(context.Background())
-
-	require.Len(t, vec.upserts, 1, "different model = different vector space; not blocked")
-	assert.Equal(t, int64(100), vec.latestRV)
-}
+// ---------- Retry cap ----------
 
 func TestScanner_RetryCap_DropsEventAfterMaxAttempts(t *testing.T) {
-	// A permanently-failing event eventually exhausts its attempts. On
-	// the give-up cycle the failure no longer pins lowestFailedRv, so
-	// the cursor advances past its RV — which is the whole point.
-	st := &fakeStorage{}
 	vec := newFakeVector()
 	vec.upsertErr = errBoom
-	s, _ := newScannerNoBootstrap(t, st, vec)
-
-	ev := dashEvent(resourcepb.WatchEvent_ADDED, "ns", "boom", 100, minimalDashboard("boom", "Boom"))
-	s.enqueue(ev)
+	s, _ := newScanner(t, &fakeStorage{}, vec)
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "boom", 100, minimalDashboard("boom", "Boom")))
 
 	for i := 0; i < maxEventAttempts; i++ {
 		s.runOnce(context.Background())
 	}
 
-	require.Equal(t, 0, s.queueLen(), "event dropped after exhausting attempts")
-	assert.Empty(t, vec.upserts, "every attempt failed; nothing was embedded")
-	assert.Equal(t, int64(100), vec.latestRV, "cursor advanced past the dropped event")
+	require.Equal(t, 0, s.queueLen(), "event dropped after max attempts")
+	assert.Empty(t, vec.upserts)
+	// First failure pinned the cursor at lowestFailedRv-1 (= 99). On
+	// the give-up cycle the failure no longer pins it, but no successful
+	// event has a higher RV, so the cursor stays at 99 until something
+	// past it succeeds.
+	assert.Equal(t, int64(99), vec.latestRV)
 
-	// A subsequent healthy event proves the scanner is unblocked.
+	// A subsequent healthy event proves the scanner is unblocked and
+	// advances the cursor.
 	vec.upsertErr = nil
 	s.enqueue(dashEvent(resourcepb.WatchEvent_MODIFIED, "ns-other", "ok", 200, minimalDashboard("ok", "OK")))
 	s.runOnce(context.Background())
-
 	require.Len(t, vec.upserts, 1)
 	assert.Equal(t, int64(200), vec.latestRV)
 }
 
 func TestScanner_RetryCap_FreshHigherRVResetsBudget(t *testing.T) {
-	// A new write at a higher RV for the same dashboard replaces the
-	// failing event and gets a fresh attempt budget.
-	st := &fakeStorage{}
 	vec := newFakeVector()
-	s, _ := newScannerNoBootstrap(t, st, vec)
+	s, _ := newScanner(t, &fakeStorage{}, vec)
 
-	// First, a failing event that's burned several attempts.
 	failingEv := dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash", 100, minimalDashboard("dash", "v1"))
-	failingEv.attempts = maxEventAttempts - 1 // simulate prior cycles
+	failingEv.attempts = maxEventAttempts - 1
 	s.enqueue(failingEv)
 
-	// New write to the same dashboard at a higher RV — fresh event,
-	// attempts=0 by default. Dedup should replace the older one and
-	// reset the budget.
-	freshEv := dashEvent(resourcepb.WatchEvent_MODIFIED, "ns", "dash", 200, minimalDashboard("dash", "v2"))
-	s.enqueue(freshEv)
+	s.enqueue(dashEvent(resourcepb.WatchEvent_MODIFIED, "ns", "dash", 200, minimalDashboard("dash", "v2")))
 
-	// One cycle succeeds (no upsertErr), so attempts=0+1=1, well under cap.
 	s.runOnce(context.Background())
 
-	require.Len(t, vec.upserts, 1, "fresh higher-RV event processed")
+	require.Len(t, vec.upserts, 1)
 	assert.Equal(t, int64(200), vec.upserts[0][0].ResourceVersion)
 	assert.Equal(t, int64(200), vec.latestRV)
 }
 
 func TestScanner_RetryCap_ReEnqueuePreservesAttempts(t *testing.T) {
-	// One failing cycle bumps attempts to 1; the re-enqueued event
-	// keeps that count rather than resetting.
-	st := &fakeStorage{}
 	vec := newFakeVector()
 	vec.upsertErr = errBoom
-	s, _ := newScannerNoBootstrap(t, st, vec)
-
-	ev := dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash", 100, minimalDashboard("dash", "v1"))
-	s.enqueue(ev)
+	s, _ := newScanner(t, &fakeStorage{}, vec)
+	s.enqueue(dashEvent(resourcepb.WatchEvent_ADDED, "ns", "dash", 100, minimalDashboard("dash", "v1")))
 
 	s.runOnce(context.Background())
-	require.Equal(t, 1, s.queueLen(), "event re-enqueued after first failure")
+	require.Equal(t, 1, s.queueLen())
 
-	// Inspect the queued event directly: same pointer should be back.
 	s.queueMu.Lock()
 	queued := s.queue[eventQueueKey(dashGroup, dashRes, "ns", "dash")]
 	s.queueMu.Unlock()
 	require.NotNil(t, queued)
-	assert.Equal(t, 1, queued.attempts, "first attempt recorded")
+	assert.Equal(t, 1, queued.attempts)
 }
+
+// ---------- chooseTarget unit ----------
 
 func TestChooseTarget(t *testing.T) {
 	const noFail = int64(1<<63 - 1)

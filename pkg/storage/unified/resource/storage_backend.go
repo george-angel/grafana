@@ -1540,9 +1540,12 @@ func applyPagination(keys []DataKey, lastSeenRV int64) []DataKey {
 // before sinceRv. If a `lastCalledWithSinceRv` parameter is passed, the
 // lookback may be skipped as an optimization.
 func (k *kvStorageBackend) ListModifiedSince(ctx context.Context, key NamespacedResource, sinceRv int64, lastCalledWithSinceRv *time.Time) (int64, iter.Seq2[*ModifiedResource, error]) {
-	if !key.Valid() {
+	// Empty namespace is allowed: the underlying datastore.Keys handles
+	// it via Prefix() and the write-path scanner uses cross-namespace
+	// scans to discover everything past its checkpoint in one call.
+	if key.Group == "" || key.Resource == "" {
 		return 0, func(yield func(*ModifiedResource, error) bool) {
-			yield(nil, fmt.Errorf("group, resource, and namespace are required"))
+			yield(nil, fmt.Errorf("group and resource are required"))
 		}
 	}
 
@@ -1666,7 +1669,13 @@ func (k *kvStorageBackend) listModifiedSinceDataStore(ctx context.Context, key N
 				lastSeenDataKey = dataKey
 			}
 
-			if lastSeenResource.Key.Name != dataKey.Name {
+			// Boundary detection on (namespace, name) so cross-namespace
+			// scans yield same-named resources from different namespaces
+			// separately. Correctness assumes dataStore.Keys returns
+			// keys in ascending lex order with the shape
+			// `group/resource/ns/name/rv`, so all rows for a given
+			// (namespace, name) are contiguous.
+			if lastSeenResource.Key.Namespace != dataKey.Namespace || lastSeenResource.Key.Name != dataKey.Name {
 				value, err := k.getValueFromDataStore(ctx, lastSeenDataKey)
 				if err != nil {
 					yield(&ModifiedResource{}, err)
@@ -1723,15 +1732,19 @@ func (k *kvStorageBackend) listModifiedSinceEventStore(ctx context.Context, key 
 				return
 			}
 
-			if evtKey.Group != key.Group || evtKey.Resource != key.Resource || evtKey.Namespace != key.Namespace {
+			if evtKey.Group != key.Group || evtKey.Resource != key.Resource {
+				continue
+			}
+			// Empty key.Namespace = cross-namespace scan; otherwise filter to one namespace.
+			if key.Namespace != "" && evtKey.Namespace != key.Namespace {
 				continue
 			}
 
-			if _, ok := seen[evtKey.Name]; ok {
+			dedupKey := evtKey.Namespace + "/" + evtKey.Name
+			if _, ok := seen[dedupKey]; ok {
 				continue
 			}
-
-			seen[evtKey.Name] = struct{}{}
+			seen[dedupKey] = struct{}{}
 			value, err := k.getValueFromDataStore(ctx, DataKey(evtKey))
 			if err != nil {
 				yield(&ModifiedResource{}, err)
@@ -1753,62 +1766,6 @@ func (k *kvStorageBackend) listModifiedSinceEventStore(ctx context.Context, key 
 			}
 		}
 	}
-}
-
-// ListNamespacesModifiedSince returns the distinct namespaces with at
-// least one event in the event store for the given group/resource and
-// resource_version greater than sinceRv. Cheap discovery for write-path
-// scanners that want to fan out per-namespace work without enumerating
-// every namespace via GetResourceStats.
-//
-// Reuses eventStore.ListKeysSince and ParseEventKey — no new assumptions
-// about KV.Keys ordering or shape, just iteration over event keys with
-// rv > sinceRv (which ListKeysSince already does via a StartKey range
-// query).
-//
-// Note: events have a retention window. If a process has been down
-// longer than that window, namespaces whose only changes were pruned
-// will not appear here. Callers that need broader recovery should
-// supplement with a full backfill.
-func (k *kvStorageBackend) ListNamespacesModifiedSince(ctx context.Context, group, resource string, sinceRv int64) ([]string, error) {
-	if group == "" || resource == "" {
-		return nil, fmt.Errorf("group and resource are required")
-	}
-
-	ctx, span := tracer.Start(ctx, "resource.kvStorageBackend.ListNamespacesModifiedSince", trace.WithAttributes(
-		attribute.String("group", group),
-		attribute.String("resource", resource),
-		attribute.Int64("sinceRv", sinceRv),
-	))
-	defer span.End()
-
-	if sinceRv <= 0 {
-		sinceRv = 1
-	}
-	sinceRv = toSnowflakeRV(sinceRv)
-
-	seen := map[string]struct{}{}
-	for evtKeyStr, err := range k.eventStore.ListKeysSince(ctx, sinceRv, SortOrderAsc) {
-		if err != nil {
-			return nil, fmt.Errorf("list event keys: %w", err)
-		}
-		evtKey, err := ParseEventKey(evtKeyStr)
-		if err != nil {
-			return nil, fmt.Errorf("parse event key %q: %w", evtKeyStr, err)
-		}
-		if evtKey.Group != group || evtKey.Resource != resource {
-			continue
-		}
-		if evtKey.Namespace == "" {
-			continue
-		}
-		seen[evtKey.Namespace] = struct{}{}
-	}
-	out := make([]string, 0, len(seen))
-	for ns := range seen {
-		out = append(out, ns)
-	}
-	return out, nil
 }
 
 // ListHistory is like ListIterator, but it returns the history of a resource.
