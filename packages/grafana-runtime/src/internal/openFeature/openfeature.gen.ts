@@ -35,6 +35,8 @@ export const FlagKeys = {
   FaroSessionReplay: "faroSessionReplay",
   /** Enables the new Flame Graph UI containing the Call Tree view */
   FlameGraphWithCallTree: "flameGraphWithCallTree",
+  /** Enables log level inference from log line contents when level is not defined as a field or a label */
+  GrafanaLogLevelInference: "grafana.logLevelInference",
   /** Whether to use the new SharedPreferences functional component */
   GrafanaNewPreferencesPage: "grafana.newPreferencesPage",
   /** Enables org-defined dashboard templates for enterprise */
@@ -200,6 +202,17 @@ export const useFlagFaroSessionReplay = (options?: ReactFlagEvaluationOptions): 
  */
 export const useFlagFlameGraphWithCallTree = (options?: ReactFlagEvaluationOptions): boolean => {
   return useFlag("flameGraphWithCallTree", false, options).value;
+};
+
+/**
+ * Enables log level inference from log line contents when level is not defined as a field or a label
+ *
+ * **Details:**
+ * - flag key: `grafana.logLevelInference`
+ * - default value: `false`
+ */
+export const useFlagGrafanaLogLevelInference = (options?: ReactFlagEvaluationOptions): boolean => {
+  return useFlag("grafana.logLevelInference", false, options).value;
 };
 
 /**
