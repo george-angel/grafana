@@ -32,8 +32,6 @@ import (
 	"github.com/grafana/grafana/pkg/storage/unified/resource"
 	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
 	"github.com/grafana/grafana/pkg/storage/unified/search"
-	"github.com/grafana/grafana/pkg/storage/unified/search/embed/backfill"
-	"github.com/grafana/grafana/pkg/storage/unified/search/embed/writepath"
 	"github.com/grafana/grafana/pkg/storage/unified/search/embed/embedder"
 	"github.com/grafana/grafana/pkg/storage/unified/search/vector"
 	"github.com/grafana/grafana/pkg/util/scheduler"
@@ -182,41 +180,12 @@ func ProvideUnifiedStorageGrpcService(cfg *setting.Cfg,
 		s.subservices = append(s.subservices, s.queue, s.scheduler)
 	}
 
-	bf, err := backfill.ProvideVectorBackfiller(cfg, backend, vectorBackend, embedderInstance)
-	if err != nil {
-		return nil, fmt.Errorf("create vector backfiller: %w", err)
-	}
-	if bf != nil {
-		s.subservices = append(s.subservices,
-			services.NewBasicService(nil, bf.Run, nil).WithName("vector-backfiller"))
-	}
+	// Vector backfiller and write-path scanner are now constructed
+	// inside the resource server (registerServer below) via
+	// withVectorIndexers. Their lifetime is bound to the server's
+	// ctx; Stop() joins them.
 
-	// Reuse the resource server's WatchWriteEvents broadcaster instead
-	// of opening a parallel WatchWriteEvents subscription. The server is
-	// constructed below in registerServer; the closure captures `s` and
-	// resolves the broadcaster lazily at scanner.Run() time.
-	subscribeWriteEvents := func(ctx context.Context, name string) (<-chan *resource.WrittenEvent, func(), error) {
-		bs, ok := s.serverStopper.(resource.WriteEventsBroadcaster)
-		if !ok || bs == nil {
-			return nil, nil, fmt.Errorf("write-events broadcaster unavailable")
-		}
-		ch, err := bs.SubscribeWriteEvents(ctx, name)
-		if err != nil {
-			return nil, nil, err
-		}
-		return ch, func() { bs.UnsubscribeWriteEvents(ch) }, nil
-	}
-	scanner, err := writepath.ProvideScanner(cfg, backend, vectorBackend, embedderInstance, subscribeWriteEvents)
-	if err != nil {
-		return nil, fmt.Errorf("create vector write-path scanner: %w", err)
-	}
-	if scanner != nil {
-		s.subservices = append(s.subservices,
-			services.NewBasicService(nil, scanner.Run, nil).WithName("vector-write-scanner"))
-	}
-
-	err = s.initializeSubservicesManager()
-	if err != nil {
+	if err := s.initializeSubservicesManager(); err != nil {
 		return nil, fmt.Errorf("failed to initialize subservices manager: %w", err)
 	}
 

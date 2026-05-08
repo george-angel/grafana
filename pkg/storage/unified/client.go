@@ -9,8 +9,6 @@ import (
 	"github.com/fullstorydev/grpchan"
 	grpcUtils "github.com/grafana/grafana/pkg/storage/unified/resource/grpc"
 	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
-	"github.com/grafana/grafana/pkg/storage/unified/search/embed/backfill"
-	"github.com/grafana/grafana/pkg/storage/unified/search/embed/writepath"
 	otgrpc "github.com/opentracing-contrib/go-grpc"
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
@@ -170,20 +168,6 @@ func newClient(opts options.StorageOptions,
 			}
 		}
 
-		// only ever enabled for local dev
-		bf, err := backfill.ProvideVectorBackfiller(cfg, backend, vectorBackend, embedderInstance)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create embedding backfiller: %w", err)
-		}
-		if bf != nil {
-			// Single-binary lifetime: tie Run to the process via context.Background.
-			go func() {
-				if rerr := bf.Run(context.Background()); rerr != nil {
-					cfg.Logger.Error("embedding backfiller stopped", "err", rerr)
-				}
-			}()
-		}
-
 		serverOptions := sql.ServerOptions{
 			Backend:        backend,
 			VectorBackend:  vectorBackend,
@@ -242,33 +226,9 @@ func newClient(opts options.StorageOptions,
 			return nil, err
 		}
 
-		// Vector write-path scanner. Subscribes to the resource server's
-		// broadcaster so we don't open a parallel WatchWriteEvents.
-		// Constructed after the server because the broadcaster comes up
-		// inside NewResourceServer's Init call.
-		subscribeWriteEvents := func(ctx context.Context, name string) (<-chan *resource.WrittenEvent, func(), error) {
-			bs, ok := server.(resource.WriteEventsBroadcaster)
-			if !ok {
-				return nil, nil, fmt.Errorf("write-events broadcaster unavailable")
-			}
-			ch, err := bs.SubscribeWriteEvents(ctx, name)
-			if err != nil {
-				return nil, nil, err
-			}
-			return ch, func() { bs.UnsubscribeWriteEvents(ch) }, nil
-		}
-		scanner, err := writepath.ProvideScanner(cfg, backend, vectorBackend, embedderInstance, subscribeWriteEvents)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create vector write-path scanner: %w", err)
-		}
-		if scanner != nil {
-			// Single-binary lifetime: tie Run to the process via context.Background.
-			go func() {
-				if rerr := scanner.Run(context.Background()); rerr != nil {
-					cfg.Logger.Error("vector write-path scanner stopped", "err", rerr)
-				}
-			}()
-		}
+		// Vector backfiller and write-path scanner are constructed inside
+		// the resource server (sql.NewResourceServer → withVectorIndexers).
+		// Their lifetime is bound to the server's ctx; Stop joins them.
 
 		return resource.NewLocalResourceClient(server), nil
 	}

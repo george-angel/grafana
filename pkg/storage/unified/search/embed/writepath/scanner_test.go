@@ -50,19 +50,11 @@ func multiPanelDashboard(uid, title string, n int) []byte {
 func newScanner(t *testing.T, st *fakeStorage, vec *fakeVector) (*Scanner, *fakeText) {
 	t.Helper()
 	text := &fakeText{dim: 4}
-	subscribe := func(ctx context.Context, _ string) (<-chan *resource.WrittenEvent, func(), error) {
-		ch, err := st.WatchWriteEvents(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-		return ch, func() {}, nil
-	}
 	s, err := New(Options{
 		Storage:       st,
 		VectorBackend: vec,
 		Embedder:      newFakeEmbedder(text),
 		Builders:      []embed.Builder{dashboard.New()},
-		Subscribe:     subscribe,
 		PollInterval:  time.Hour,
 	})
 	require.NoError(t, err)
@@ -94,9 +86,6 @@ func dashChange(action resourcepb.WatchEvent_Type, ns, name string, rv int64, va
 }
 
 func TestScanner_NewValidatesInputs(t *testing.T) {
-	noopSubscribe := func(context.Context, string) (<-chan *resource.WrittenEvent, func(), error) {
-		return nil, func() {}, nil
-	}
 	cases := []struct {
 		name string
 		mod  func(*Options)
@@ -105,7 +94,6 @@ func TestScanner_NewValidatesInputs(t *testing.T) {
 		{"missing vector", func(o *Options) { o.VectorBackend = nil }},
 		{"missing embedder", func(o *Options) { o.Embedder = nil }},
 		{"missing builders", func(o *Options) { o.Builders = nil }},
-		{"missing subscribe", func(o *Options) { o.Subscribe = nil }},
 		{"missing embedder model", func(o *Options) {
 			e := *o.Embedder
 			e.Model = ""
@@ -119,7 +107,6 @@ func TestScanner_NewValidatesInputs(t *testing.T) {
 				VectorBackend: newFakeVector(),
 				Embedder:      newFakeEmbedder(&fakeText{dim: 4}),
 				Builders:      []embed.Builder{dashboard.New()},
-				Subscribe:     noopSubscribe,
 			}
 			tc.mod(&opts)
 			_, err := New(opts)

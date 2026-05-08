@@ -18,7 +18,9 @@ import (
 	"github.com/grafana/grafana/pkg/setting"
 	"github.com/grafana/grafana/pkg/storage/unified/resource"
 	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
+	"github.com/grafana/grafana/pkg/storage/unified/search/embed/backfill"
 	"github.com/grafana/grafana/pkg/storage/unified/search/embed/embedder"
+	"github.com/grafana/grafana/pkg/storage/unified/search/embed/writepath"
 	"github.com/grafana/grafana/pkg/storage/unified/search/vector"
 )
 
@@ -65,6 +67,7 @@ func NewUninitializedResourceServer(opts ServerOptions) (resource.ResourceServer
 		withBackend,
 		withVectorBackend,
 		withEmbedder,
+		withVectorIndexers,
 		withQOSQueue,
 		withOverridesService,
 		withSearch,
@@ -200,6 +203,29 @@ func withVectorBackend(opts *ServerOptions, resourceOpts *resource.ResourceServe
 // the VectorSearch handler returns Unimplemented when it's absent.
 func withEmbedder(opts *ServerOptions, resourceOpts *resource.ResourceServerOptions) error {
 	resourceOpts.Embedder = opts.Embedder
+	return nil
+}
+
+// withVectorIndexers builds the optional vector backfiller and write-path
+// scanner. Both providers return (nil, nil) when their feature is off, so
+// nil is normal and propagates through to the resource server which
+// simply doesn't start the goroutine.
+func withVectorIndexers(opts *ServerOptions, resourceOpts *resource.ResourceServerOptions) error {
+	bf, err := backfill.ProvideVectorBackfiller(opts.Cfg, opts.Backend, opts.VectorBackend, opts.Embedder)
+	if err != nil {
+		return fmt.Errorf("create vector backfiller: %w", err)
+	}
+	if bf != nil {
+		resourceOpts.VectorBackfiller = bf
+	}
+
+	scanner, err := writepath.ProvideScanner(opts.Cfg, opts.Backend, opts.VectorBackend, opts.Embedder)
+	if err != nil {
+		return fmt.Errorf("create vector write-path scanner: %w", err)
+	}
+	if scanner != nil {
+		resourceOpts.VectorWriteScanner = scanner
+	}
 	return nil
 }
 

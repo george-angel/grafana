@@ -352,6 +352,33 @@ type ResourceServerOptions struct {
 	// VectorSearch RPC. nil when no [vector_embedder] provider is configured;
 	// the RPC then returns Unimplemented.
 	Embedder *embedder.Embedder
+
+	// VectorBackfiller, when non-nil, is launched in a background
+	// goroutine after Init. The server tracks it in its WaitGroup so
+	// Stop blocks until it returns. nil = backfill feature off.
+	VectorBackfiller VectorIndexer
+
+	// VectorWriteScanner, when non-nil, is launched alongside the
+	// backfiller; the server attaches its own broadcaster to it before
+	// starting Run so the scanner's watch path lights up. nil =
+	// write-path scanner feature off.
+	VectorWriteScanner VectorWriteScanner
+}
+
+// VectorIndexer is anything the server can launch in a goroutine and
+// that exits cleanly on context cancel. Used for the vector backfiller
+// and the write-path scanner — kept abstract so the resource package
+// doesn't need to import the concrete packages (which would cycle).
+type VectorIndexer interface {
+	Run(ctx context.Context) error
+}
+
+// VectorWriteScanner is a VectorIndexer that wants the server's
+// write-events broadcaster attached before Run. The server sets this
+// up once initWatcher has populated its broadcaster.
+type VectorWriteScanner interface {
+	VectorIndexer
+	UseBroadcaster(b Broadcaster[*WrittenEvent])
 }
 
 func (opts ResourceServerOptions) bulkBatchOptions() BulkBatchOptions {
@@ -485,6 +512,8 @@ func NewUninitializedResourceServer(opts ResourceServerOptions) (*server, error)
 		quotasConfig:                   opts.QuotasConfig,
 		artificialSuccessfulWriteDelay: opts.Search.IndexMinUpdateInterval,
 		bookmarkFrequency:              opts.BookmarkFrequency,
+		vectorBackfiller:               opts.VectorBackfiller,
+		vectorWriteScanner:             opts.VectorWriteScanner,
 	}
 
 	if opts.Search.Resources != nil {
@@ -584,6 +613,12 @@ type server struct {
 	storageEnabled                 bool
 
 	bookmarkFrequency time.Duration
+
+	// Async vector indexers (backfiller + write-path scanner).
+	// Started in Init, joined in Stop via indexersWG.
+	vectorBackfiller   VectorIndexer
+	vectorWriteScanner VectorWriteScanner
+	indexersWG         sync.WaitGroup
 }
 
 // Init implements ResourceServer.
@@ -604,11 +639,46 @@ func (s *server) Init(ctx context.Context) error {
 			s.initErr = s.initWatcher()
 		}
 
+		// Launch async vector indexers (backfiller + write-path
+		// scanner) once the broadcaster is up. They run for the
+		// server's lifetime and Stop() joins them via indexersWG.
+		if s.initErr == nil {
+			s.startVectorIndexers()
+		}
+
 		if s.initErr != nil {
 			s.log.Error("error running resource server init", "error", s.initErr)
 		}
 	})
 	return s.initErr
+}
+
+// startVectorIndexers launches the configured backfiller and write-path
+// scanner. Both are optional (nil = feature off). The scanner gets the
+// server's broadcaster via UseBroadcaster before Run; the backfiller
+// doesn't need the watch path.
+func (s *server) startVectorIndexers() {
+	if s.vectorBackfiller != nil {
+		s.indexersWG.Add(1)
+		go func() {
+			defer s.indexersWG.Done()
+			if err := s.vectorBackfiller.Run(s.ctx); err != nil && !errors.Is(err, context.Canceled) {
+				s.log.Error("vector backfiller stopped", "err", err)
+			}
+		}()
+	}
+	if s.vectorWriteScanner != nil {
+		if s.broadcaster != nil {
+			s.vectorWriteScanner.UseBroadcaster(s.broadcaster)
+		}
+		s.indexersWG.Add(1)
+		go func() {
+			defer s.indexersWG.Done()
+			if err := s.vectorWriteScanner.Run(s.ctx); err != nil && !errors.Is(err, context.Canceled) {
+				s.log.Error("vector write-path scanner stopped", "err", err)
+			}
+		}()
+	}
 }
 
 // trackWrite atomically checks the stopping flag and increments the in-flight
@@ -648,6 +718,20 @@ func (s *server) Stop(ctx context.Context) error {
 		s.log.Debug("all in-flight write operations completed")
 	case <-ctx.Done():
 		s.log.Warn("timed out waiting for in-flight write operations to complete")
+	}
+
+	// Wait for async vector indexers (backfiller, write-path scanner)
+	// to wind down. They observe s.ctx, so the cancel above unblocks them.
+	indexersDone := make(chan struct{})
+	go func() {
+		s.indexersWG.Wait()
+		close(indexersDone)
+	}()
+	select {
+	case <-indexersDone:
+		s.log.Debug("vector indexers stopped")
+	case <-ctx.Done():
+		s.log.Warn("timed out waiting for vector indexers to stop")
 	}
 
 	var stopFailed bool

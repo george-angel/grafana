@@ -92,15 +92,13 @@ func eventQueueKey(group, resource, namespace, name string) string {
 	return group + "/" + resource + "/" + namespace + "/" + name
 }
 
-// SubscribeFunc attaches the scanner to a write-event stream. Returning
-// a nil channel and a no-op release disables the watch path entirely
-// (useful in tests) — bootstrap alone keeps the index correct, just
-// without the per-write nudge.
+// The scanner attaches a write-events broadcaster via UseBroadcaster
+// after the resource server's own broadcaster comes up. Without one
+// the scanner still runs (bootstrap + periodic poll) but won't get
+// per-write nudges.
 //
-// Called at scanner.Run() time, not at construction, so the underlying
-// resource server has had a chance to initialise its broadcaster
-// before the scanner actually subscribes.
-type SubscribeFunc func(ctx context.Context, name string) (<-chan *resource.WrittenEvent, func(), error)
+// Signature matches resource.VectorWriteScanner.UseBroadcaster so the
+// Scanner type implicitly satisfies that interface.
 
 type Options struct {
 	Storage       resource.StorageBackend
@@ -109,9 +107,6 @@ type Options struct {
 	Builders      []embed.Builder
 	PollInterval  time.Duration
 	Log           log.Logger
-
-	// Subscribe is the write-event source. Required.
-	Subscribe SubscribeFunc
 }
 
 // Scanner is the write-path indexer. One per process; coordinated across
@@ -122,15 +117,35 @@ type Scanner struct {
 	embedder      *embedder.Embedder
 	batchEmbedder *embedder.BatchEmbedder
 	builders      map[string]embed.Builder // keyed by resource
-	subscribe     SubscribeFunc
 	pollInterval  time.Duration
 	log           log.Logger
+
+	// broadcaster is attached after construction (the resource server
+	// owns it; scanner is wired in via the server's Init). nil disables
+	// the watch path; bootstrap + periodic poll still run.
+	broadcasterMu sync.Mutex
+	broadcaster   resource.Broadcaster[*resource.WrittenEvent]
 
 	// queue holds at most one pendingEvent per resource. Enqueue keeps
 	// the highest RV; the cycle drains it under lock, processes, and
 	// re-enqueues anything that didn't make it.
 	queueMu sync.Mutex
 	queue   map[string]*pendingEvent
+}
+
+// UseBroadcaster attaches the write-events source. Safe to call before
+// or after Run, but only the value present when Run starts is used —
+// changing it mid-run has no effect on an already-active subscription.
+func (s *Scanner) UseBroadcaster(b resource.Broadcaster[*resource.WrittenEvent]) {
+	s.broadcasterMu.Lock()
+	defer s.broadcasterMu.Unlock()
+	s.broadcaster = b
+}
+
+func (s *Scanner) currentBroadcaster() resource.Broadcaster[*resource.WrittenEvent] {
+	s.broadcasterMu.Lock()
+	defer s.broadcasterMu.Unlock()
+	return s.broadcaster
 }
 
 func New(opts Options) (*Scanner, error) {
@@ -148,9 +163,6 @@ func New(opts Options) (*Scanner, error) {
 	}
 	if len(opts.Builders) == 0 {
 		return nil, fmt.Errorf("writepath: at least one Builder is required")
-	}
-	if opts.Subscribe == nil {
-		return nil, fmt.Errorf("writepath: Subscribe is required")
 	}
 	builders := make(map[string]embed.Builder, len(opts.Builders))
 	for _, b := range opts.Builders {
@@ -171,7 +183,6 @@ func New(opts Options) (*Scanner, error) {
 		embedder:      opts.Embedder,
 		batchEmbedder: embedder.NewBatchEmbedder(*opts.Embedder),
 		builders:      builders,
-		subscribe:     opts.Subscribe,
 		pollInterval:  opts.PollInterval,
 		log:           opts.Log,
 		queue:         make(map[string]*pendingEvent),
@@ -242,15 +253,19 @@ func (s *Scanner) Run(ctx context.Context) error {
 	// The broadcaster's ring-buffer cache replays recent events to the
 	// new subscriber, which gives us a small natural overlap between
 	// "what we caught with bootstrap" and "what watch tells us next".
-	ch, release, err := s.subscribe(ctx, "vector-write-scanner")
-	if err != nil {
-		logger.Error("writepath: subscribe to write events", "err", err)
-		// Subscribe failure isn't fatal; the periodic loop still works
-		// from bootstrap output, just without per-write nudges.
-	} else if ch != nil {
-		defer release()
-		go s.consumeWatchEvents(ctx, ch)
-		logger.Info("writepath: subscribed to write events broadcaster")
+	if b := s.currentBroadcaster(); b != nil {
+		ch, err := b.Subscribe(ctx, "vector-write-scanner")
+		if err != nil {
+			logger.Error("writepath: subscribe to write events", "err", err)
+			// Subscribe failure isn't fatal; the periodic loop still works
+			// from bootstrap output, just without per-write nudges.
+		} else if ch != nil {
+			defer b.Unsubscribe(ch)
+			go s.consumeWatchEvents(ctx, ch)
+			logger.Info("writepath: subscribed to write events broadcaster")
+		}
+	} else {
+		logger.Warn("writepath: no broadcaster attached; running in poll-only mode")
 	}
 
 	s.bootstrap(ctx)

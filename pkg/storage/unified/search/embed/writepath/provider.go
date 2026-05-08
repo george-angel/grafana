@@ -15,15 +15,13 @@ import (
 // pattern as backfill.ProvideVectorBackfiller, so callers must tolerate
 // a nil result.
 //
-// `subscribe` is the write-event source. The standard wiring resolves
-// it to the resource server's broadcaster lazily so the server has had
-// a chance to initialise before the scanner subscribes.
+// The caller is expected to attach a broadcaster via Scanner.UseBroadcaster
+// before calling Run; without one the scanner runs in poll-only mode.
 func ProvideScanner(
 	cfg *setting.Cfg,
 	storage resource.StorageBackend,
 	vb vector.VectorBackend,
 	emb *embedder.Embedder,
-	subscribe SubscribeFunc,
 ) (*Scanner, error) {
 	logger := log.New("writepath")
 	switch {
@@ -42,16 +40,12 @@ func ProvideScanner(
 	case emb == nil:
 		logger.Info("writepath: disabled (no embedder)")
 		return nil, nil
-	case subscribe == nil:
-		logger.Info("writepath: disabled (no write-event subscriber wired)")
-		return nil, nil
 	}
 	return New(Options{
 		Storage:       storage,
 		VectorBackend: vb,
 		Embedder:      emb,
 		Builders:      []embed.Builder{dashboard.New()},
-		Subscribe:     subscribe,
 		Log:           logger,
 	})
 }
